@@ -1,0 +1,165 @@
+#include "mbed.h"
+#include <cstring>
+
+// Buzzer pin (active LOW)
+DigitalOut buzzer(PTB2);  // LOW = ON
+
+// LCD I2C pins
+I2C i2c(PTE25, PTE24);
+const int LCD_ADDRESS = 0x27 << 1;  // Adjust if needed
+
+// Output pin to signal LCD is ready (optional)
+DigitalOut lcd_ready(PTC3);  // HIGH = LCD updated
+
+// Digital output to control the lock (drives the transistor/solenoid)
+// HIGH = lock open, LOW = lock closed
+DigitalOut lock(PTC4);
+
+// Serial interface for receiving commands via USB
+BufferedSerial pc(USBTX, USBRX, 115200);
+
+// LCD Control defines
+#define LCD_BACKLIGHT 0x08
+#define ENABLE 0x04
+
+// Function to send a nibble to the LCD
+void lcd_send_nibble(uint8_t data) {
+    char temp;
+    temp = data | LCD_BACKLIGHT | ENABLE;
+    i2c.write(LCD_ADDRESS, &temp, 1);
+    temp = data | LCD_BACKLIGHT;
+    i2c.write(LCD_ADDRESS, &temp, 1);
+}
+
+// Send command to LCD
+void lcd_send_cmd(uint8_t cmd) {
+    lcd_send_nibble(cmd & 0xF0);
+    lcd_send_nibble((cmd << 4) & 0xF0);
+    ThisThread::sleep_for(2ms);
+}
+
+// Send data to LCD
+void lcd_send_data(uint8_t data) {
+    lcd_send_nibble((data & 0xF0) | 0x01);
+    lcd_send_nibble(((data << 4) & 0xF0) | 0x01);
+    ThisThread::sleep_for(2ms);
+}
+
+// Initialize the LCD
+void lcd_init() {
+    ThisThread::sleep_for(50ms);  // Wait for LCD to power up
+    lcd_send_cmd(0x03);
+    lcd_send_cmd(0x03);
+    lcd_send_cmd(0x03);
+    lcd_send_cmd(0x02);  // Set to 4-bit mode
+    lcd_send_cmd(0x28);  // 2-line display, 5x7 font
+    lcd_send_cmd(0x0C);  // Display ON, cursor OFF
+    lcd_send_cmd(0x06);  // Auto-increment cursor
+    lcd_send_cmd(0x01);  // Clear display
+    ThisThread::sleep_for(5ms);
+}
+
+// Print a string on the LCD (clears display first)
+void lcd_print(const char *str) {
+    lcd_send_cmd(0x01);  // Clear display command
+    ThisThread::sleep_for(5ms);
+    while (*str) {
+        lcd_send_data(*str++);
+    }
+}
+
+// Clear the LCD (simply clears the display)
+void lcd_clear() {
+    lcd_send_cmd(0x01);
+    ThisThread::sleep_for(5ms);
+}
+
+// Helper: sound the buzzer for a given duration (ms)
+void sound_buzzer(int duration_ms) {
+    buzzer = 0; // Active LOW: 0 means sound ON
+    ThisThread::sleep_for(duration_ms);
+    buzzer = 1;
+}
+
+// Process the received command string.
+// "Pass" -> beep once, show "Access Granted" for 3 sec, open lock for 5 sec, then close lock.
+// "Failed" -> beep three times, show "Access Denied" for 3 sec, then clear LCD.
+void process_command(const char *cmd) {
+    if (strcasecmp(cmd, "pass") == 0) {
+        // Pass: Sound buzzer once
+        sound_buzzer(500);
+        lcd_print("Access Granted");
+        lcd_ready = 1;
+        // Open the lock
+        lock = 1;
+        // Keep lock open for 5 seconds
+        ThisThread::sleep_for(5000ms);
+        lock = 0;
+        // Wait 3 seconds with the message
+        ThisThread::sleep_for(3000ms);
+        lcd_clear();
+    }
+    else if (strcasecmp(cmd, "failed") == 0) {
+        // Failed: Sound buzzer three times
+        for (int i = 0; i < 3; i++) {
+            sound_buzzer(300);
+            ThisThread::sleep_for(200ms);
+        }
+        lcd_print("Access Denied");
+        lcd_ready = 1;
+        // Wait 3 seconds then clear LCD
+        ThisThread::sleep_for(3000ms);
+        lcd_clear();
+    }
+    else {
+        // Unrecognized command; optionally, show error message.
+        lcd_print("Cmd Unknown");
+        ThisThread::sleep_for(2000ms);
+        lcd_clear();
+    }
+}
+
+int main() {
+    // Set initial states
+    buzzer = 1;      // Buzzer off (active LOW)
+    lcd_ready = 0;   // LCD not updated yet
+    lock = 0;        // Lock closed (solenoid off)
+
+    // Initialize LCD and display a welcome message
+    lcd_init();
+    lcd_print("Please Scan Face");
+    
+    
+    // Buffer to hold incoming serial data
+    const int bufSize = 16;
+    char buf[bufSize] = {0};
+    int bufIndex = 0;
+    char incomingChar;
+
+    // Main loop: read serial input and process commands when a newline is received
+    while (true) {
+        if (pc.readable()) {
+            // Read one character at a time
+            if (pc.read(&incomingChar, 1)) {
+                // If newline or carriage return, process the command
+                if (incomingChar == '\n' || incomingChar == '\r') {
+                    buf[bufIndex] = '\0'; // Null-terminate
+                    if (bufIndex > 0) {
+                        //Serial.printf("Received command: %s\n", buf);
+                        process_command(buf);
+                        lcd_print("Please Scan Face");
+                    }
+                    // Clear the buffer for the next command
+                    bufIndex = 0;
+                    memset(buf, 0, bufSize);
+                } else {
+                    // Append the character if there is space
+                    if (bufIndex < bufSize - 1) {
+                        buf[bufIndex++] = incomingChar;
+                    }
+                }
+            }
+        }
+        ThisThread::sleep_for(10ms);
+    }
+}
